@@ -4,3 +4,6 @@ python-multipart
 ollama
 python-docx
 pymupdf
+pytest
+pytest-asyncio
+httpx
