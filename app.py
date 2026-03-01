@@ -1,16 +1,24 @@
-import json
 import io
+import json
+import logging
+import re
 import zipfile
+from contextlib import asynccontextmanager
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import List
 
 import fitz  # pymupdf
 import uvicorn
 from docx import Document
+from docx.oxml.ns import qn
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from ollama import AsyncClient
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a technical writer converting articles into RAG-optimized format.
 
@@ -47,8 +55,23 @@ RULES:
 Return only the article. No commentary."""
 
 SUPPORTED_EXTENSIONS = {".docx", ".pdf", ".html", ".htm", ".txt", ".md", ".rst"}
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+MODEL_PATTERN = re.compile(r"^[\w.:\-]{1,128}$")
 
-app = FastAPI()
+# --- Ollama client lifecycle ---
+
+ollama_client: AsyncClient | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global ollama_client
+    ollama_client = AsyncClient()
+    yield
+    ollama_client = None
+
+
+app = FastAPI(lifespan=lifespan)
 
 # --- Document Parsers ---
 
@@ -57,37 +80,60 @@ class _TextExtractor(HTMLParser):
     def __init__(self):
         super().__init__()
         self._parts: list[str] = []
-        self._skip = False
+        self._skip_depth = 0
 
     def handle_starttag(self, tag, attrs):
         if tag in ("script", "style"):
-            self._skip = True
+            self._skip_depth += 1
 
     def handle_endtag(self, tag):
-        if tag in ("script", "style"):
-            self._skip = False
+        if tag in ("script", "style") and self._skip_depth > 0:
+            self._skip_depth -= 1
         if tag in ("p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr"):
             self._parts.append("\n")
 
     def handle_data(self, data):
-        if not self._skip:
+        if self._skip_depth == 0:
             self._parts.append(data)
 
     def get_text(self) -> str:
         return "".join(self._parts).strip()
 
 
+def _extract_docx(content: bytes) -> str:
+    doc = Document(io.BytesIO(content))
+    parts: list[str] = []
+    for block in doc.element.body:
+        tag = block.tag.split("}")[-1]
+        if tag == "p":
+            text = "".join(
+                node.text or ""
+                for node in block.iter()
+                if node.tag in (qn("w:t"), qn("w:delText"))
+            )
+            if text.strip():
+                parts.append(text)
+        elif tag == "tbl":
+            for row in block.iter(qn("w:tr")):
+                cells = [
+                    "".join(n.text or "" for n in cell.iter(qn("w:t")))
+                    for cell in row.iter(qn("w:tc"))
+                ]
+                row_text = " | ".join(c.strip() for c in cells if c.strip())
+                if row_text:
+                    parts.append(row_text)
+    return "\n".join(parts)
+
+
 def extract_text(filename: str, content: bytes) -> str:
     ext = Path(filename).suffix.lower()
 
     if ext == ".docx":
-        doc = Document(io.BytesIO(content))
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        return _extract_docx(content)
 
     if ext == ".pdf":
-        pdf = fitz.open(stream=content, filetype="pdf")
-        pages = [page.get_text() for page in pdf]
-        pdf.close()
+        with fitz.open(stream=content, filetype="pdf") as pdf:
+            pages = [page.get_text() for page in pdf]
         return "\n".join(pages).strip()
 
     if ext in (".html", ".htm"):
@@ -115,8 +161,7 @@ async def health():
 @app.get("/api/models")
 async def list_models():
     try:
-        client = AsyncClient()
-        response = await client.list()
+        response = await ollama_client.list()
         models = [{"name": m.model, "size": m.size} for m in response.models]
         return {"models": models}
     except Exception:
@@ -125,7 +170,13 @@ async def list_models():
 
 @app.post("/api/transform")
 async def transform(file: UploadFile = File(...), model: str = Form(...)):
-    content = await file.read()
+    if not MODEL_PATTERN.match(model):
+        raise HTTPException(status_code=422, detail="Invalid model name")
+
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large (max 50 MB)")
+
     filename = file.filename or "unknown.txt"
 
     ext = Path(filename).suffix.lower()
@@ -147,8 +198,7 @@ async def transform(file: UploadFile = File(...), model: str = Form(...)):
 
         full_text = ""
         try:
-            client = AsyncClient()
-            stream = await client.chat(
+            stream = await ollama_client.chat(
                 model=model,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
@@ -157,27 +207,40 @@ async def transform(file: UploadFile = File(...), model: str = Form(...)):
                 stream=True,
             )
             async for chunk in stream:
-                token = chunk["message"]["content"]
+                token = chunk.message.content
                 full_text += token
                 yield f"data: {json.dumps({'token': token})}\n\n"
             yield f"data: {json.dumps({'done': True, 'full_text': full_text})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        except Exception:
+            logger.exception("Ollama stream error")
+            yield f"data: {json.dumps({'error': 'AI generation failed. Check that Ollama is running and the model is available.'})}\n\n"
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+class FileEntry(BaseModel):
+    name: str = Field(max_length=255)
+    text: str = Field(max_length=5 * 1024 * 1024)
+
+
+class DownloadPayload(BaseModel):
+    files: List[FileEntry] = Field(min_length=1, max_length=100)
 
 
 @app.post("/api/download-all")
-async def download_all(payload: dict):
-    files = payload.get("files", [])
-    if not files:
-        raise HTTPException(status_code=400, detail="No files provided")
-
+async def download_all(payload: DownloadPayload):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in files:
-            name = Path(f["name"]).stem + "_rag.txt"
-            zf.writestr(name, f["text"])
+        for f in payload.files:
+            safe_stem = re.sub(r"[^\w\-.]", "_", Path(f.name).stem)
+            zf.writestr(f"{safe_stem}_rag.txt", f.text)
     buf.seek(0)
 
     return Response(
@@ -190,6 +253,7 @@ async def download_all(payload: dict):
 # --- Static File Serving ---
 
 dist_dir = Path(__file__).parent / "dist"
+dist_dir_resolved = dist_dir.resolve()
 
 if (dist_dir / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=str(dist_dir / "assets")), name="assets")
@@ -197,11 +261,15 @@ if (dist_dir / "assets").is_dir():
 
 @app.get("/{path:path}")
 async def serve_spa(path: str):
-    # Try to serve the exact file first
-    file_path = dist_dir / path
+    file_path = (dist_dir / path).resolve()
+    # Prevent path traversal
+    try:
+        file_path.relative_to(dist_dir_resolved)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid path")
+
     if path and file_path.is_file():
         return FileResponse(str(file_path))
-    # Fall back to index.html for SPA routing
     index = dist_dir / "index.html"
     if index.is_file():
         return FileResponse(str(index))

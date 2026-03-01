@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react"
+import { useState, useCallback, useRef, useEffect } from "react"
 import type { FileItem } from "../App"
 
 interface Props {
@@ -37,13 +37,24 @@ export default function FileList({
 }: Props) {
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [copiedAll, setCopiedAll] = useState(false)
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const copyAllTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Cleanup timers on unmount
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+      if (copyAllTimerRef.current) clearTimeout(copyAllTimerRef.current)
+    }
+  }, [])
 
   const handleCopy = useCallback(
     (id: string, e: React.MouseEvent) => {
       e.stopPropagation()
       onCopy(id)
       setCopiedId(id)
-      setTimeout(() => setCopiedId(null), 2000)
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+      copyTimerRef.current = setTimeout(() => setCopiedId(null), 2000)
     },
     [onCopy]
   )
@@ -51,7 +62,8 @@ export default function FileList({
   const handleCopyAll = useCallback(() => {
     onCopyAll()
     setCopiedAll(true)
-    setTimeout(() => setCopiedAll(false), 2000)
+    if (copyAllTimerRef.current) clearTimeout(copyAllTimerRef.current)
+    copyAllTimerRef.current = setTimeout(() => setCopiedAll(false), 2000)
   }, [onCopyAll])
 
   const doneFiles = files.filter((f) => f.status === "done")
@@ -85,6 +97,7 @@ export default function FileList({
               {file.status === "done" && (
                 <>
                   <button
+                    aria-label={`Copy ${file.name}`}
                     className={`text-[10px] px-2 py-0.5 rounded-sm transition-all ${
                       copiedId === file.id
                         ? "bg-[#1a3a1a] border border-[#2d6a2d] text-success"
@@ -95,6 +108,7 @@ export default function FileList({
                     {copiedId === file.id ? "✓" : "Copy"}
                   </button>
                   <button
+                    aria-label={`Download ${file.name}`}
                     className="text-[10px] px-2 py-0.5 border border-border text-muted rounded-sm hover:text-text hover:border-muted transition-all"
                     onClick={(e) => {
                       e.stopPropagation()
@@ -107,6 +121,7 @@ export default function FileList({
               )}
               {file.status !== "processing" && (
                 <button
+                  aria-label={`Remove ${file.name}`}
                   className="text-[10px] px-2 py-0.5 border border-border text-muted rounded-sm hover:text-error hover:border-error transition-all"
                   onClick={(e) => {
                     e.stopPropagation()

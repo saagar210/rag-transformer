@@ -15,7 +15,7 @@ export default function ModelSelector({ models, selected, onChange }: Props) {
     <select
       value={selected}
       onChange={(e) => onChange(e.target.value)}
-      className="bg-surface border border-border text-text text-xs px-3 py-1.5 rounded-sm cursor-pointer hover:border-muted transition-colors focus:outline-none focus:border-muted"
+      className="bg-surface border border-border text-text text-xs px-3 py-1.5 rounded-sm cursor-pointer hover:border-muted transition-colors focus:outline-none focus:ring-1 focus:ring-muted focus:border-muted"
     >
       {models.map((m) => (
         <option key={m} value={m}>

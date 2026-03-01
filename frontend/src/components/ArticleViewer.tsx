@@ -21,11 +21,20 @@ export default function ArticleViewer({
 }: Props) {
   const [copied, setCopied] = useState(false)
   const transformedRef = useRef<HTMLDivElement>(null)
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Cleanup timer on unmount
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+    }
+  }, [])
 
   const handleCopy = useCallback(() => {
     onCopy()
     setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+    if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+    copyTimerRef.current = setTimeout(() => setCopied(false), 2000)
   }, [onCopy])
 
   // Auto-scroll transformed pane during streaming

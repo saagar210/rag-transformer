@@ -15,6 +15,7 @@ interface Props {
 export default function DropZone({ onFilesAdded, hasFiles }: Props) {
   const [dragOver, setDragOver] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  const dragCountRef = useRef(0)
 
   const handleFiles = useCallback(
     (fileList: FileList | null) => {
@@ -25,67 +26,96 @@ export default function DropZone({ onFilesAdded, hasFiles }: Props) {
     [onFilesAdded]
   )
 
+  const onDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    dragCountRef.current++
+    setDragOver(true)
+  }, [])
+
   const onDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault()
-    setDragOver(true)
   }, [])
 
   const onDragLeave = useCallback((e: React.DragEvent) => {
     e.preventDefault()
-    setDragOver(false)
+    dragCountRef.current--
+    if (dragCountRef.current <= 0) {
+      dragCountRef.current = 0
+      setDragOver(false)
+    }
   }, [])
 
   const onDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault()
+      dragCountRef.current = 0
       setDragOver(false)
       handleFiles(e.dataTransfer.files)
     },
     [handleFiles]
   )
 
+  const onKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault()
+        inputRef.current?.click()
+      }
+    },
+    []
+  )
+
+  const sharedProps = {
+    role: "button" as const,
+    tabIndex: 0,
+    onDragEnter,
+    onDragOver,
+    onDragLeave,
+    onDrop,
+    onKeyDown,
+    onClick: () => inputRef.current?.click(),
+  }
+
+  const fileInput = (
+    <input
+      ref={inputRef}
+      type="file"
+      multiple
+      accept=".docx,.pdf,.html,.htm,.txt,.md,.rst"
+      className="hidden"
+      onChange={(e) => {
+        handleFiles(e.target.files)
+        e.target.value = ""
+      }}
+    />
+  )
+
   if (hasFiles) {
     return (
       <div
-        className={`border border-dashed rounded-sm p-3 text-center cursor-pointer transition-colors ${
+        {...sharedProps}
+        className={`border border-dashed rounded-sm p-3 text-center cursor-pointer transition-colors focus:outline-none focus:border-muted ${
           dragOver
             ? "border-accent bg-surface"
             : "border-border hover:border-muted"
         }`}
-        onDragOver={onDragOver}
-        onDragLeave={onDragLeave}
-        onDrop={onDrop}
-        onClick={() => inputRef.current?.click()}
       >
         <p className="text-xs text-dim">
           {dragOver ? "Release to add files" : "Drop more files or click to browse"}
         </p>
-        <input
-          ref={inputRef}
-          type="file"
-          multiple
-          accept=".docx,.pdf,.html,.htm,.txt,.md,.rst"
-          className="hidden"
-          onChange={(e) => {
-            handleFiles(e.target.files)
-            e.target.value = ""
-          }}
-        />
+        {fileInput}
       </div>
     )
   }
 
   return (
     <div
-      className={`border-2 border-dashed rounded-sm p-8 text-center cursor-pointer transition-colors ${
+      {...sharedProps}
+      className={`border-2 border-dashed rounded-sm p-8 text-center cursor-pointer transition-colors focus:outline-none focus:border-muted ${
         dragOver
           ? "border-accent bg-surface"
           : "border-border hover:border-muted"
       }`}
-      onDragOver={onDragOver}
-      onDragLeave={onDragLeave}
-      onDrop={onDrop}
-      onClick={() => inputRef.current?.click()}
     >
       <div className="text-dim text-xs tracking-wide space-y-3">
         <p className="text-border text-2xl">╌╌╌╌╌╌╌</p>
@@ -94,17 +124,7 @@ export default function DropZone({ onFilesAdded, hasFiles }: Props) {
         <p className="text-border text-2xl">╌╌╌╌╌╌╌</p>
         <p className="text-[10px] text-dim mt-4">.docx .pdf .md .txt .html</p>
       </div>
-      <input
-        ref={inputRef}
-        type="file"
-        multiple
-        accept=".docx,.pdf,.html,.htm,.txt,.md,.rst"
-        className="hidden"
-        onChange={(e) => {
-          handleFiles(e.target.files)
-          e.target.value = ""
-        }}
-      />
+      {fileInput}
     </div>
   )
 }
