@@ -14,6 +14,116 @@ export interface FileItem {
   error?: string
 }
 
+function parseSSELine(
+  line: string,
+  fileId: string,
+  setFiles: React.Dispatch<React.SetStateAction<FileItem[]>>
+) {
+  if (!line.startsWith("data: ")) return
+  try {
+    const payload = JSON.parse(line.slice(6))
+    if (payload.original) {
+      setFiles((p) =>
+        p.map((f) => (f.id === fileId ? { ...f, originalText: payload.original } : f))
+      )
+    } else if (payload.error) {
+      setFiles((p) =>
+        p.map((f) =>
+          f.id === fileId ? { ...f, status: "error", error: payload.error } : f
+        )
+      )
+    } else if (payload.token) {
+      setFiles((p) =>
+        p.map((f) =>
+          f.id === fileId
+            ? { ...f, transformedText: f.transformedText + payload.token }
+            : f
+        )
+      )
+    } else if (payload.done) {
+      setFiles((p) =>
+        p.map((f) =>
+          f.id === fileId
+            ? { ...f, status: "done", transformedText: payload.full_text }
+            : f
+        )
+      )
+    }
+  } catch {
+    // skip malformed JSON
+  }
+}
+
+async function processFile(
+  fileId: string,
+  file: File,
+  model: string,
+  signal: AbortSignal,
+  setFiles: React.Dispatch<React.SetStateAction<FileItem[]>>
+) {
+  const formData = new FormData()
+  formData.append("file", file)
+  formData.append("model", model)
+
+  const response = await fetch("/api/transform", {
+    method: "POST",
+    body: formData,
+    signal,
+  })
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ detail: "Server error" }))
+    setFiles((p) =>
+      p.map((f) =>
+        f.id === fileId
+          ? { ...f, status: "error", error: err.detail || "Server error" }
+          : f
+      )
+    )
+    return
+  }
+
+  const reader = response.body!.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    const lines = buffer.split("\n")
+    buffer = lines.pop() || ""
+
+    for (const line of lines) {
+      parseSSELine(line, fileId, setFiles)
+    }
+  }
+
+  // Flush remaining buffer
+  if (buffer.trim()) {
+    parseSSELine(buffer.trim(), fileId, setFiles)
+  }
+
+  // If still processing (no done event), mark done with whatever we have
+  setFiles((p) =>
+    p.map((f) =>
+      f.id === fileId && f.status === "processing" ? { ...f, status: "done" } : f
+    )
+  )
+}
+
+function triggerDownload(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement("a")
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
 export default function App() {
   const [files, setFiles] = useState<FileItem[]>([])
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null)
@@ -23,6 +133,11 @@ export default function App() {
   )
   const [ollamaError, setOllamaError] = useState<string | null>(null)
   const processingRef = useRef(false)
+  const controllersRef = useRef<Map<string, AbortController>>(new Map())
+  const filesRef = useRef(files)
+  filesRef.current = files
+  const modelRef = useRef(selectedModel)
+  modelRef.current = selectedModel
 
   // Fetch models on mount
   useEffect(() => {
@@ -37,13 +152,14 @@ export default function App() {
         }
         const names = (data.models || []).map((m: { name: string }) => m.name)
         setModels(names)
-        if (names.length > 0 && !names.includes(selectedModel)) {
-          setSelectedModel(names[0])
-        }
+        setSelectedModel((prev) => {
+          if (names.length > 0 && !names.includes(prev)) return names[0]
+          return prev
+        })
       })
       .catch(() => setOllamaError("Cannot reach Ollama. Make sure it's running."))
     return () => controller.abort()
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [])
 
   // Persist model selection
   useEffect(() => {
@@ -54,207 +170,119 @@ export default function App() {
   const processNext = useCallback(async () => {
     if (processingRef.current) return
 
-    setFiles((prev) => {
-      const next = prev.find((f) => f.status === "queued")
-      if (!next) return prev
-      processingRef.current = true
+    const currentFiles = filesRef.current
+    const next = currentFiles.find((f) => f.status === "queued")
+    if (!next) return
 
-      // Start processing async
-      const fileId = next.id
-      const file = next.file
+    processingRef.current = true
+    const fileId = next.id
+    const file = next.file
 
-      ;(async () => {
-        setFiles((p) => p.map((f) => (f.id === fileId ? { ...f, status: "processing" } : f)))
-        setSelectedFileId(fileId)
+    setFiles((p) => p.map((f) => (f.id === fileId ? { ...f, status: "processing" } : f)))
+    setSelectedFileId(fileId)
 
-        const formData = new FormData()
-        formData.append("file", file)
-        formData.append("model", selectedModel)
+    const controller = new AbortController()
+    controllersRef.current.set(fileId, controller)
 
-        try {
-          const response = await fetch("/api/transform", {
-            method: "POST",
-            body: formData,
-          })
-
-          if (!response.ok) {
-            const err = await response.json().catch(() => ({ detail: "Server error" }))
-            setFiles((p) =>
-              p.map((f) =>
-                f.id === fileId
-                  ? { ...f, status: "error", error: err.detail || "Server error" }
-                  : f
-              )
-            )
-            processingRef.current = false
-            return
-          }
-
-          const reader = response.body!.getReader()
-          const decoder = new TextDecoder()
-          let buffer = ""
-
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-            buffer += decoder.decode(value, { stream: true })
-
-            const lines = buffer.split("\n")
-            buffer = lines.pop() || ""
-
-            for (const line of lines) {
-              if (!line.startsWith("data: ")) continue
-              try {
-                const payload = JSON.parse(line.slice(6))
-                if (payload.original) {
-                  setFiles((p) =>
-                    p.map((f) =>
-                      f.id === fileId ? { ...f, originalText: payload.original } : f
-                    )
-                  )
-                } else if (payload.error) {
-                  setFiles((p) =>
-                    p.map((f) =>
-                      f.id === fileId
-                        ? { ...f, status: "error", error: payload.error }
-                        : f
-                    )
-                  )
-                } else if (payload.token) {
-                  setFiles((p) =>
-                    p.map((f) =>
-                      f.id === fileId
-                        ? { ...f, transformedText: f.transformedText + payload.token }
-                        : f
-                    )
-                  )
-                } else if (payload.done) {
-                  setFiles((p) =>
-                    p.map((f) =>
-                      f.id === fileId
-                        ? { ...f, status: "done", transformedText: payload.full_text }
-                        : f
-                    )
-                  )
-                }
-              } catch {
-                // skip malformed JSON
-              }
-            }
-          }
-
-          // If still processing (no done event), mark done with whatever we have
-          setFiles((p) =>
-            p.map((f) =>
-              f.id === fileId && f.status === "processing"
-                ? { ...f, status: "done" }
-                : f
-            )
+    try {
+      await processFile(fileId, file, modelRef.current, controller.signal, setFiles)
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setFiles((p) =>
+          p.map((f) =>
+            f.id === fileId
+              ? { ...f, status: "error", error: "Processing failed unexpectedly." }
+              : f
           )
-        } catch (err) {
-          setFiles((p) =>
-            p.map((f) =>
-              f.id === fileId
-                ? { ...f, status: "error", error: String(err) }
-                : f
-            )
-          )
-        }
+        )
+      }
+    }
 
-        processingRef.current = false
-      })()
+    controllersRef.current.delete(fileId)
+    processingRef.current = false
+  }, [])
 
-      return prev.map((f) => (f.id === fileId ? { ...f, status: "processing" } : f))
-    })
-  }, [selectedModel])
-
-  // Watch for queue changes
+  // Watch for queue changes — trigger next file
   useEffect(() => {
     if (!processingRef.current && files.some((f) => f.status === "queued")) {
       processNext()
     }
   }, [files, processNext])
 
-  const handleFilesAdded = useCallback(
-    (newFiles: File[]) => {
-      const items: FileItem[] = newFiles.map((file) => ({
-        id: crypto.randomUUID(),
-        file,
-        name: file.name,
-        status: "queued" as const,
-        originalText: "",
-        transformedText: "",
-      }))
-      setFiles((prev) => [...prev, ...items])
-      if (!selectedFileId && items.length > 0) {
-        setSelectedFileId(items[0].id)
-      }
-    },
-    [selectedFileId]
-  )
+  const handleFilesAdded = useCallback((newFiles: File[]) => {
+    const items: FileItem[] = newFiles.map((file) => ({
+      id: crypto.randomUUID(),
+      file,
+      name: file.name,
+      status: "queued" as const,
+      originalText: "",
+      transformedText: "",
+    }))
+    setFiles((prev) => [...prev, ...items])
+    setSelectedFileId((prev) => prev ?? items[0]?.id ?? null)
+  }, [])
 
-  const handleRemove = useCallback(
-    (id: string) => {
-      setFiles((prev) => prev.filter((f) => f.id !== id))
-      if (selectedFileId === id) {
-        setSelectedFileId(null)
-      }
-    },
-    [selectedFileId]
-  )
+  const handleRemove = useCallback((id: string) => {
+    // Abort in-flight stream if any
+    controllersRef.current.get(id)?.abort()
+    controllersRef.current.delete(id)
 
-  const handleCopy = useCallback(
-    (id: string) => {
-      const file = files.find((f) => f.id === id)
-      if (file?.transformedText) {
-        navigator.clipboard.writeText(file.transformedText)
-      }
-    },
-    [files]
-  )
+    setFiles((prev) => {
+      const updated = prev.filter((f) => f.id !== id)
+      return updated
+    })
+    setSelectedFileId((prev) => {
+      if (prev !== id) return prev
+      // Select adjacent file
+      const current = filesRef.current
+      const idx = current.findIndex((f) => f.id === id)
+      const next = current[idx + 1] || current[idx - 1]
+      return next?.id ?? null
+    })
+  }, [])
+
+  const handleCopy = useCallback((id: string) => {
+    const file = filesRef.current.find((f) => f.id === id)
+    if (file?.transformedText) {
+      navigator.clipboard.writeText(file.transformedText)
+    }
+  }, [])
 
   const handleCopyAll = useCallback(() => {
-    const doneFiles = files.filter((f) => f.status === "done")
+    const doneFiles = filesRef.current.filter((f) => f.status === "done")
     const text = doneFiles
       .map((f) => `--- ${f.name} ---\n\n${f.transformedText}`)
       .join("\n\n")
     navigator.clipboard.writeText(text)
-  }, [files])
+  }, [])
 
-  const handleDownload = useCallback(
-    (id: string) => {
-      const file = files.find((f) => f.id === id)
-      if (!file?.transformedText) return
-      const stem = file.name.replace(/\.[^.]+$/, "")
-      const blob = new Blob([file.transformedText], { type: "text/plain" })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement("a")
-      a.href = url
-      a.download = `${stem}_rag.txt`
-      a.click()
-      URL.revokeObjectURL(url)
-    },
-    [files]
-  )
+  const handleDownload = useCallback((id: string) => {
+    const file = filesRef.current.find((f) => f.id === id)
+    if (!file?.transformedText) return
+    const stem = file.name.replace(/\.[^.]+$/, "")
+    const blob = new Blob([file.transformedText], { type: "text/plain" })
+    triggerDownload(blob, `${stem}_rag.txt`)
+  }, [])
 
   const handleDownloadAll = useCallback(async () => {
-    const doneFiles = files.filter((f) => f.status === "done")
-    const payload = {
-      files: doneFiles.map((f) => ({ name: f.name, text: f.transformedText })),
+    const doneFiles = filesRef.current.filter((f) => f.status === "done")
+    if (doneFiles.length === 0) return
+    try {
+      const payload = {
+        files: doneFiles.map((f) => ({ name: f.name, text: f.transformedText })),
+      }
+      const response = await fetch("/api/download-all", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      })
+      if (!response.ok) throw new Error("Download failed")
+      const blob = await response.blob()
+      triggerDownload(blob, "rag-transformed.zip")
+    } catch (err) {
+      console.error("Download all failed:", err)
     }
-    const response = await fetch("/api/download-all", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    })
-    const blob = await response.blob()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement("a")
-    a.href = url
-    a.download = "rag-transformed.zip"
-    a.click()
-    URL.revokeObjectURL(url)
-  }, [files])
+  }, [])
 
   const selectedFile = files.find((f) => f.id === selectedFileId) || null
 
